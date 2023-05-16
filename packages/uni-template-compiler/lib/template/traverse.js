@@ -306,19 +306,27 @@ function traverseRenderSlot (callExprNode, state) {
   let deleteSlotName = false // 标记是否组件 slot 手动指定了 name="default"
   if (state.options.scopedSlotsCompiler !== 'augmented' && callExprNode.arguments.length > 2) { // 作用域插槽
     const props = {}
-    callExprNode.arguments[2].properties.forEach(property => {
-      props[property.key.value] = genCode(property.value)
-    })
+    const arg2 = callExprNode.arguments[2]
+    const arg3 = callExprNode.arguments[3]
+    let bindings
+    if (t.isObjectExpression(arg2)) {
+      arg2.properties.forEach(property => {
+        props[property.key.value] = genCode(property.value)
+      })
+    } else if (arg3) {
+      bindings = genCode(arg3)
+    }
     deleteSlotName = props.SLOT_DEFAULT && Object.keys(props).length === 1
     if (!deleteSlotName) {
-      if (!isStaticSlotName) {
+      // TODO 非原生支持作用域插槽的平台在未启用增强的模式下也允许使用动态插槽名
+      if (!isStaticSlotName && !['mp-baidu', 'mp-alipay'].includes(state.options.platform.name)) {
         state.errors.add(uniI18n.__('templateCompiler.notSupportDynamicSlotName', { 0: 'v-slot' }))
         return
       }
       delete props.SLOT_DEFAULT
       return genSlotNode(
         slotName,
-        state.options.platform.createScopedSlots(slotName, props, state),
+        state.options.platform.createScopedSlots(slotName, bindings || props, state),
         callExprNode.arguments[1],
         state
       )
@@ -351,12 +359,15 @@ function traverseResolveScopedSlots (callExprNode, state) {
   const supportTemplateSlotPlatforms = ['mp-baidu', 'mp-toutiao']
   // 支持访问当前节点 v-for 作用域的平台
   const supportCurrentScopePlatforms = ['mp-weixin', 'mp-alipay']
-  function merge (node, ignore, vIfs = [], top) {
+  function merge (node, ignore, vIfs = [], top, needRealNode) {
     if (!top) {
+      // 支付宝小程序使用静态插槽时可以在非实体节点使用 slot 属性，其他小程序 named slot 需移动到实体节点
+      const slot = node.attr.slot
+      needRealNode = slot && slot !== 'default' && !supportTemplateSlotPlatforms.includes(platformName) && !(platformName === 'mp-alipay' && !/\{\{.+?\}\}/.test(slot))
       node = { children: [node] }
       top = node
     }
-    const children = node.children
+    let children = node.children
     let nodeAttr = node.attr || {}
     function resolveVIf () {
       if (vIfs.length) {
@@ -365,35 +376,51 @@ function traverseResolveScopedSlots (callExprNode, state) {
         vIfs.length = 0
       }
     }
-    if (Array.isArray(children) && children.length === 1) {
-      let child = children[0]
-      if (child.type) {
-        const attr = child.attr || {}
-        // 除 v-if 外与父节点无同名属性且当前节点无 v-for 作用域且父节点 v-for 支持访问当前节点作用域，向上合并
-        // TODO 父节点访问变量不与当前 v-for 作用域内变量同名时，可向上合并
-        if (!Object.keys(attr).find(key => key !== vIfAttrName && key in nodeAttr) && !attr[vForAttrName] && (supportCurrentScopePlatforms.includes(platformName) || !nodeAttr[vForAttrName])) {
-          if (attr[vIfAttrName]) {
-            vIfs.push(attr[vIfAttrName])
-            delete attr[vIfAttrName]
+    if (Array.isArray(children)) {
+      children = children.filter(child => !!child)
+      let slotNode
+      if (children.length === 1) {
+        let child = children[0]
+        if (child.type) {
+          const attr = child.attr || {}
+          // 除 v-if 外与父节点无同名属性且当前节点无 v-for 作用域且父节点 v-for 支持访问当前节点作用域，向上合并
+          // TODO 父节点访问变量不与当前 v-for 作用域内变量同名时，可向上合并
+          if (!Object.keys(attr).find(key => key !== vIfAttrName && key in nodeAttr) && !attr[vForAttrName] && (supportCurrentScopePlatforms.includes(platformName) || !nodeAttr[vForAttrName])) {
+            if (attr[vIfAttrName]) {
+              vIfs.push(attr[vIfAttrName])
+              delete attr[vIfAttrName]
+            }
+            child.attr = nodeAttr = Object.assign(attr, nodeAttr)
+            for (const key in child) {
+              node[key] = child[key]
+            }
+            child = node
+          } else {
+            resolveVIf()
           }
-          node.type = child.type
-          node.attr = child.attr = nodeAttr = Object.assign(attr, nodeAttr)
-          node.children = child.children
-          child = node
-        } else {
-          resolveVIf()
-        }
-        if (ignore.includes(child.type)) {
-          return merge(child, ignore, vIfs, top)
-        } else if (!supportTemplateSlotPlatforms.includes(platformName)) {
-          // 其他小程序 named slot 需移动到实体节点
-          const slot = top.attr.slot
-          if (slot && slot !== 'default') {
-            // TODO 多层 v-for 嵌套时，此处理导致作用域发生变化，需安全重命名
-            delete top.attr.slot
-            attr.slot = slot
+          if (ignore.includes(child.type)) {
+            return merge(child, ignore, vIfs, top, needRealNode)
+          } else if (needRealNode) {
+            slotNode = child
           }
+        } else if (needRealNode) {
+          node.type = 'text'
+          slotNode = node
         }
+      } else if (needRealNode) {
+        // TODO 依据子节点类型
+        node.type = 'view'
+        slotNode = node
+      }
+      if (slotNode && slotNode !== top) {
+        // TODO 多层 v-for 嵌套时，此处理导致作用域发生变化，需安全重命名 slot name
+        ['slot', 'slot-scope'].forEach(key => {
+          const topAttr = top.attr
+          if (key in topAttr) {
+            slotNode.attr[key] = topAttr[key]
+            delete topAttr[key]
+          }
+        })
       }
     }
     resolveVIf()
@@ -451,7 +478,7 @@ function traverseResolveScopedSlots (callExprNode, state) {
       const parentName = parentNode.type
 
       const paramExprNode = fnProperty.value.params[0]
-      return options.platform.resolveScopedSlots(
+      const node = options.platform.resolveScopedSlots(
         slotName, {
           genCode,
           generate,
@@ -470,6 +497,12 @@ function traverseResolveScopedSlots (callExprNode, state) {
         },
         state
       )
+      // 对原生支持作用域插槽的小程序平台，优化节点
+      if (['mp-baidu', 'mp-alipay'].includes(platformName)) {
+        node.attr[ATTR_SLOT_ORIGIN] = slotNameOrigin
+        return merge(node, ['template', 'block'])
+      }
+      return node
     }
     if (options.scopedSlotsCompiler === 'auto' && slotNode.scopedSlotsCompiler === 'augmented') {
       parentNode.attr['scoped-slots-compiler'] = 'augmented'
